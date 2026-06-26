@@ -21,7 +21,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"image"
+	"regexp"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -30,7 +32,9 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-slack/pkg/bridgeidentity"
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
@@ -41,6 +45,117 @@ var (
 	ErrMediaConvertFailed   = errors.New("failed to re-encode media")
 	ErrMediaOnlyEditCaption = errors.New("only media message caption can be edited")
 )
+
+func appendLinkPreviewURLs(content *event.MessageEventContent, previews []*event.BeeperLinkPreview) {
+	content.EnsureHasHTML()
+	for _, lp := range previews {
+		if lp == nil || lp.MatchedURL == "" {
+			continue
+		}
+		if strings.Contains(content.Body, lp.MatchedURL) || strings.Contains(content.FormattedBody, lp.MatchedURL) {
+			continue
+		}
+		escaped := html.EscapeString(lp.MatchedURL)
+		content.FormattedBody += fmt.Sprintf(`<p><a href="%s">%s</a></p>`, escaped, escaped)
+		if content.Body != "" {
+			content.Body += "\n"
+		}
+		content.Body += lp.MatchedURL
+	}
+}
+
+func (mc *MessageConverter) matrixUserDisplayName(ctx context.Context, portal *bridgev2.Portal, mxid id.UserID) string {
+	if member, err := mc.Bridge.Matrix.GetMemberInfo(ctx, portal.MXID, mxid); err == nil && member != nil && member.Displayname != "" {
+		return member.Displayname
+	}
+	return ""
+}
+
+func replaceMatrixUserMentionHTML(formattedBody string, userID id.UserID, label string) string {
+	escapedLabel := html.EscapeString(label)
+	mxid := regexp.QuoteMeta(string(userID))
+	re := regexp.MustCompile(`<a\b[^>]*` + mxid + `[^>]*>[^<]*</a>`)
+	return re.ReplaceAllString(formattedBody, escapedLabel)
+}
+
+func (mc *MessageConverter) replaceMatrixMentionsWithLabels(ctx context.Context, portal *bridgev2.Portal, content *event.MessageEventContent) {
+	if content.Mentions == nil {
+		return
+	}
+	content.EnsureHasHTML()
+	var replyToMXID id.EventID
+	if rel := content.GetRelatesTo(); rel != nil {
+		replyToMXID = rel.GetNonFallbackReplyTo()
+	}
+	var replyToUser id.UserID
+	if replyToMXID != "" {
+		replyToUser = mc.matrixReplyToUser(ctx, content)
+	}
+	for _, userID := range content.Mentions.UserIDs {
+		if bridgeidentity.SlackUserIDForMXID(userID) != "" || bridgeidentity.DiscordIDForMXID(userID) != "" {
+			continue
+		}
+		if replyToUser != "" && (bridgeidentity.IsSlackBridgeBot(userID) || bridgeidentity.IsDiscordBridgeBot(userID)) {
+			if bridgeidentity.SlackUserIDForMXID(replyToUser) != "" || bridgeidentity.DiscordIDForMXID(replyToUser) != "" {
+				continue
+			}
+		}
+		name := mc.matrixUserDisplayName(ctx, portal, userID)
+		if name == "" {
+			continue
+		}
+		label := "[" + name + "]"
+		content.FormattedBody = replaceMatrixUserMentionHTML(content.FormattedBody, userID, label)
+		content.Body = strings.ReplaceAll(content.Body, name, label)
+	}
+}
+
+func relaySlackProfileOptions(mc *MessageConverter, origSender *bridgev2.OrigSender) []slack.MsgOption {
+	options := []slack.MsgOption{slack.MsgOptionUsername(origSender.FormattedName)}
+	urlProvider, ok := mc.Bridge.Matrix.(bridgev2.MatrixConnectorWithPublicMedia)
+	avatarURL := origSender.AvatarURL
+	if origSender.PerMessageProfile.AvatarURL != nil && *origSender.PerMessageProfile.AvatarURL != "" {
+		avatarURL = *origSender.PerMessageProfile.AvatarURL
+	}
+	if ok && avatarURL != "" {
+		if publicAvatarURL := urlProvider.GetPublicMediaAddress(avatarURL); publicAvatarURL != "" {
+			options = append(options, slack.MsgOptionIconURL(publicAvatarURL))
+		}
+	}
+	return options
+}
+
+func relaySlackUploadInitialComment(origSender *bridgev2.OrigSender, caption string) string {
+	if origSender == nil || origSender.FormattedName == "" {
+		return caption
+	}
+	if caption == "" {
+		return origSender.FormattedName
+	}
+	return origSender.FormattedName + ": " + caption
+}
+
+func shouldBroadcastDiscordReplyToChannel(content *event.MessageEventContent) bool {
+	rel := content.GetRelatesTo()
+	if rel == nil {
+		return false
+	}
+	if rel.GetThreadParent() != "" {
+		return false
+	}
+	return rel.GetNonFallbackReplyTo() != ""
+}
+
+func appendSlackThreadOptions(options []slack.MsgOption, threadRootID string, content *event.MessageEventContent) []slack.MsgOption {
+	if threadRootID == "" {
+		return options
+	}
+	options = append(options, slack.MsgOptionTS(threadRootID))
+	if shouldBroadcastDiscordReplyToChannel(content) {
+		options = append(options, slack.MsgOptionBroadcast())
+	}
+	return options
+}
 
 func isMediaMsgtype(msgType event.MessageType) bool {
 	return msgType == event.MsgImage || msgType == event.MsgAudio || msgType == event.MsgVideo || msgType == event.MsgFile
@@ -98,18 +213,26 @@ func (mc *MessageConverter) ToSlack(
 
 	switch content.MsgType {
 	case event.MsgText, event.MsgEmote, event.MsgNotice:
+		if origSender != nil {
+			appendLinkPreviewURLs(content, content.BeeperLinkPreviews)
+			if content.Mentions != nil {
+				content.Mentions.UserIDs = bridgeidentity.DedupeLinkedMentions(content.Mentions.UserIDs)
+			}
+			mc.replaceMatrixMentionsWithLabels(ctx, portal, content)
+		}
+		replyToUser := mc.matrixReplyToUser(ctx, content)
 		options := make([]slack.MsgOption, 0, 4)
 		var block slack.Block
 		if content.Format == event.FormatHTML {
-			block = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal)
+			block = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal, replyToUser)
 		} else {
-			block = mc.MatrixHTMLParser.ParseText(ctx, content.Body, content.Mentions, portal)
+			block = mc.MatrixHTMLParser.ParseText(ctx, content.Body, content.Mentions, portal, replyToUser)
 		}
 		options = append(options, slack.MsgOptionBlocks(block))
 		if editTargetID != "" {
 			options = append(options, slack.MsgOptionUpdate(editTargetID))
-		} else if threadRootID != "" {
-			options = append(options, slack.MsgOptionTS(threadRootID))
+		} else {
+			options = appendSlackThreadOptions(options, threadRootID, content)
 		}
 		if content.MsgType == event.MsgEmote {
 			options = append(options, slack.MsgOptionMeMessage())
@@ -118,14 +241,7 @@ func (mc *MessageConverter) ToSlack(
 			options = append(options, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
 		}
 		if origSender != nil {
-			options = append(options, slack.MsgOptionUsername(origSender.FormattedName))
-			urlProvider, ok := mc.Bridge.Matrix.(bridgev2.MatrixConnectorWithPublicMedia)
-			if ok && origSender.AvatarURL != "" {
-				publicAvatarURL := urlProvider.GetPublicMediaAddress(origSender.AvatarURL)
-				if publicAvatarURL != "" {
-					options = append(options, slack.MsgOptionIconURL(publicAvatarURL))
-				}
-			}
+			options = append(options, relaySlackProfileOptions(mc, origSender)...)
 		}
 		return &ConvertedSlackMessage{SendReq: slack.MsgOptionCompose(options...)}, nil
 	case event.MsgAudio, event.MsgFile, event.MsgImage, event.MsgVideo:
@@ -169,8 +285,8 @@ func (mc *MessageConverter) ToSlack(
 				Channel:         channelID,
 				ThreadTimestamp: threadRootID,
 			}
-			if caption != "" {
-				fileUpload.InitialComment = caption
+			if comment := relaySlackUploadInitialComment(origSender, caption); comment != "" {
+				fileUpload.InitialComment = comment
 			}
 			return &ConvertedSlackMessage{FileUpload: fileUpload}, nil
 		} else {
@@ -195,7 +311,7 @@ func (mc *MessageConverter) ToSlack(
 			}
 			var block slack.Block
 			if captionHTML != "" {
-				block = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal)
+				block = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal, mc.matrixReplyToUser(ctx, content))
 			} else if caption != "" {
 				block = slack.NewRichTextBlock("", slack.NewRichTextSection(slack.NewRichTextSectionTextElement(caption, nil)))
 			}

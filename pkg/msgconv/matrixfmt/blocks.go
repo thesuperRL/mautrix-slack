@@ -33,7 +33,9 @@ import (
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-slack/pkg/bridgeidentity"
 	"go.mau.fi/mautrix-slack/pkg/connector/slackdb"
+	"go.mau.fi/mautrix-slack/pkg/governancedata"
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
@@ -45,7 +47,23 @@ type Context struct {
 	Style    slack.RichTextSectionTextStyle
 	Link     string
 
-	PreserveWhitespace bool
+	PreserveWhitespace  bool
+	ReplyToUser         id.UserID
+	mentionedSlackUsers map[string]struct{}
+}
+
+func (ctx *Context) trackSlackMention(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	if ctx.mentionedSlackUsers == nil {
+		ctx.mentionedSlackUsers = make(map[string]struct{})
+	}
+	if _, ok := ctx.mentionedSlackUsers[userID]; ok {
+		return ""
+	}
+	ctx.mentionedSlackUsers[userID] = struct{}{}
+	return userID
 }
 
 func (ctx Context) WithTag(tag string) Context {
@@ -101,6 +119,17 @@ func New2(br *bridgev2.Bridge, db *slackdb.SlackDB) *HTMLParser {
 }
 
 func (parser *HTMLParser) GetMentionedUserID(mxid id.UserID, ctx Context) string {
+	if slackUserID := bridgeidentity.SlackUserIDForMXID(mxid); slackUserID != "" {
+		return ctx.trackSlackMention(slackUserID)
+	}
+	if bridgeidentity.IsSlackBridgeBot(mxid) || bridgeidentity.IsDiscordBridgeBot(mxid) {
+		if ctx.ReplyToUser != "" {
+			if slackUID := bridgeidentity.SlackUserIDForMXID(ctx.ReplyToUser); slackUID != "" {
+				return ctx.trackSlackMention(slackUID)
+			}
+		}
+		return ""
+	}
 	if ctx.Mentions != nil && !slices.Contains(ctx.Mentions.UserIDs, mxid) {
 		// If `m.mentions` is set and doesn't contain this user, don't convert the mention
 		// TODO does slack have some way to do silent mentions?
@@ -109,7 +138,7 @@ func (parser *HTMLParser) GetMentionedUserID(mxid id.UserID, ctx Context) string
 	ghostID, ok := parser.br.Matrix.ParseGhostMXID(mxid)
 	if ok {
 		_, userID := slackid.ParseUserID(ghostID)
-		return userID
+		return ctx.trackSlackMention(userID)
 	}
 	user, err := parser.br.GetExistingUserByMXID(ctx.Ctx, mxid)
 	if err != nil {
@@ -373,6 +402,9 @@ func (parser *HTMLParser) textToElements(text string, ctx Context) []slack.RichT
 	if ctx.TagStack.Has("code") || ctx.TagStack.Has("pre") || ctx.TagStack.Has("a") {
 		return []slack.RichTextSectionElement{parser.textToElement(text, ctx)}
 	}
+	if ctx.Mentions != nil && ctx.Mentions.Room && !strings.Contains(text, "@room") {
+		text = "@room " + text
+	}
 	var pattern *regexp.Regexp
 	if ctx.Mentions != nil && ctx.Mentions.Room {
 		pattern = URLOrRoomRegex
@@ -391,7 +423,18 @@ func (parser *HTMLParser) textToElements(text string, ctx Context) []slack.RichT
 			elems = append(elems, parser.textToElement(prefix, ctx))
 		}
 		if part == "@room" {
-			elems = append(elems, slack.NewRichTextSectionBroadcastElement(slack.RichTextBroadcastRangeChannel))
+			// Convert a room ping to a real Slack @channel broadcast only when
+			// governance says this channel belongs to a team. Org-wide / unlinked
+			// channels get inert "@channel" text so they don't blast the channel.
+			var channelID string
+			if ctx.Portal != nil {
+				_, channelID = slackid.ParsePortalID(ctx.Portal.ID)
+			}
+			if channelID != "" && governancedata.Get().TeamForSlackChannel(channelID) != nil {
+				elems = append(elems, slack.NewRichTextSectionBroadcastElement(slack.RichTextBroadcastRangeChannel))
+			} else {
+				elems = append(elems, parser.textToElement("@channel", ctx))
+			}
 		} else if strings.HasPrefix(part, "http://") || strings.HasPrefix(part, "https://") {
 			elems = append(elems, slack.NewRichTextSectionLinkElement(part, part, ctx.StylePtr()))
 		} else {
@@ -452,25 +495,27 @@ func (parser *HTMLParser) nodeToBlock(node *html.Node, ctx Context) *slack.RichT
 	return slack.NewRichTextBlock("", elems...)
 }
 
-func (parser *HTMLParser) ParseText(ctx context.Context, text string, mentions *event.Mentions, portal *bridgev2.Portal) *slack.RichTextBlock {
+func (parser *HTMLParser) ParseText(ctx context.Context, text string, mentions *event.Mentions, portal *bridgev2.Portal, replyToUser id.UserID) *slack.RichTextBlock {
 	formatCtx := Context{
 		Ctx:                ctx,
 		TagStack:           make(format.TagStack, 0),
 		Portal:             portal,
 		Mentions:           mentions,
 		PreserveWhitespace: true,
+		ReplyToUser:        replyToUser,
 	}
 	elems := parser.textToElements(text, formatCtx)
 	return slack.NewRichTextBlock("", slack.NewRichTextSection(elems...))
 }
 
 // Parse converts Matrix HTML into text using the settings in this parser.
-func (parser *HTMLParser) Parse(ctx context.Context, htmlData string, mentions *event.Mentions, portal *bridgev2.Portal) *slack.RichTextBlock {
+func (parser *HTMLParser) Parse(ctx context.Context, htmlData string, mentions *event.Mentions, portal *bridgev2.Portal, replyToUser id.UserID) *slack.RichTextBlock {
 	formatCtx := Context{
-		Ctx:      ctx,
-		TagStack: make(format.TagStack, 0, 4),
-		Portal:   portal,
-		Mentions: mentions,
+		Ctx:         ctx,
+		TagStack:    make(format.TagStack, 0, 4),
+		Portal:      portal,
+		Mentions:    mentions,
+		ReplyToUser: replyToUser,
 	}
 	node, _ := html.Parse(strings.NewReader(htmlData))
 	return parser.nodeToBlock(node, formatCtx)

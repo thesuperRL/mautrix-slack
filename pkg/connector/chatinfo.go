@@ -232,9 +232,8 @@ func (s *SlackClient) wrapChatInfo(ctx context.Context, info *slack.Channel, isN
 	if roomType != database.RoomTypeDM || len(members.MemberMap) == 1 {
 		name = ptr.Ptr(s.formatChannelName(info))
 	}
-	return &bridgev2.ChatInfo{
+	chatInfo := &bridgev2.ChatInfo{
 		Name:         name,
-		Topic:        ptr.Ptr(info.Topic.Value),
 		Avatar:       avatar,
 		Members:      &members,
 		Type:         &roomType,
@@ -242,7 +241,11 @@ func (s *SlackClient) wrapChatInfo(ctx context.Context, info *slack.Channel, isN
 		ExtraUpdates: extraUpdates,
 		UserLocal:    userLocal,
 		CanBackfill:  true,
-	}, nil
+	}
+	if info.Topic.Value != "" {
+		chatInfo.Topic = ptr.Ptr(info.Topic.Value)
+	}
+	return chatInfo, nil
 }
 
 func (s *SlackClient) formatChannelName(info *slack.Channel) string {

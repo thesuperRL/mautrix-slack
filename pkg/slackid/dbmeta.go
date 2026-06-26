@@ -42,4 +42,8 @@ type UserLoginMetadata struct {
 type MessageMetadata struct {
 	CaptionMerged bool   `json:"caption_merged"`
 	LastEditTS    string `json:"last_edit_ts"`
+
+	MirroredEmoji       string `json:"mirrored_emoji,omitempty"`
+	SummaryThreadTS     string `json:"summary_thread_ts,omitempty"`
+	SummaryMessageTS    string `json:"summary_message_ts,omitempty"`
 }

@@ -253,7 +253,7 @@ func (r *slackTagHTMLRenderer) renderSlackTag(w goldmarkUtil.BufWriter, source [
 			}
 			return
 		case "channel", "everyone", "here":
-			// do @room mentions?
+			_, _ = w.WriteString("@room")
 			return
 		case "subteam":
 			// do subteam handling? more spaces?

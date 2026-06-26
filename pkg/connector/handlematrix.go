@@ -27,10 +27,12 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-slack/pkg/connector/slackdb"
 	"go.mau.fi/mautrix-slack/pkg/emoji"
 	"go.mau.fi/mautrix-slack/pkg/msgconv"
+	"go.mau.fi/mautrix-slack/pkg/reactionmirror"
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
@@ -44,6 +46,21 @@ var (
 	_ bridgev2.RoomTopicHandlingNetworkAPI   = (*SlackClient)(nil)
 )
 
+
+func shouldSkipThreadCreationRelay(msg *bridgev2.MatrixMessage) bool {
+	if msg.OrigSender == nil || msg.Content == nil {
+		return false
+	}
+	body := strings.TrimSpace(msg.Content.Body)
+	if strings.HasPrefix(body, "Created a thread:") {
+		return true
+	}
+	if msg.Content.MsgType == event.MsgNotice && strings.HasPrefix(body, "Thread created.") {
+		return true
+	}
+	return false
+}
+
 func (s *SlackClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if s.Client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
@@ -51,6 +68,10 @@ func (s *SlackClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	_, channelID := slackid.ParsePortalID(msg.Portal.ID)
 	if channelID == "" {
 		return nil, errors.New("invalid channel ID")
+	}
+	if shouldSkipThreadCreationRelay(msg) {
+		zerolog.Ctx(ctx).Debug().Str("body", msg.Content.Body).Msg("Skipping thread creation notice relay to Slack")
+		return &bridgev2.MatrixMessageResponse{}, nil
 	}
 	conv, err := s.Main.MsgConv.ToSlack(ctx, s.Client, msg.Portal, msg.Content, msg.Event, msg.ThreadRoot, nil, msg.OrigSender, s.IsRealUser)
 	if err != nil {
@@ -146,6 +167,12 @@ func (s *SlackClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 }
 
 func (s *SlackClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (resp bridgev2.MatrixReactionPreResponse, err error) {
+	if msg.Event != nil && (reactionmirror.IsSlackBridgeGhost(msg.Event.Sender) || reactionmirror.IsDiscordBridgeGhost(msg.Event.Sender)) {
+		return bridgev2.MatrixReactionPreResponse{
+			SenderID: slackid.MakeUserID(s.TeamID, s.UserID),
+			Emoji:    msg.Content.RelatesTo.Key,
+		}, nil
+	}
 	key := msg.Content.RelatesTo.Key
 	var emojiID string
 	if strings.ContainsRune(key, ':') {
@@ -171,6 +198,9 @@ func (s *SlackClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2
 }
 
 func (s *SlackClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (reaction *database.Reaction, err error) {
+	if msg.Event != nil && (reactionmirror.IsSlackBridgeGhost(msg.Event.Sender) || reactionmirror.IsDiscordBridgeGhost(msg.Event.Sender)) {
+		return nil, nil
+	}
 	if s.Client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
@@ -254,6 +284,9 @@ func (s *SlackClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.Ma
 }
 
 func (s *SlackClient) HandleMatrixRoomTopic(ctx context.Context, msg *bridgev2.MatrixRoomTopic) (bool, error) {
+	if msg.Content.Topic == "" {
+		return false, nil
+	}
 	_, channelID := slackid.ParsePortalID(msg.Portal.ID)
 	if channelID == "" {
 		return false, errors.New("invalid channel ID")

@@ -568,6 +568,9 @@ func (s *SlackMessage) GetType() bridgev2.RemoteEventType {
 }
 
 func (s *SlackMessage) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
+	if s.Client.Main.isReactionMirrorSummaryMessage(portal, &s.Data.Msg) {
+		return nil, fmt.Errorf("%w: reaction mirror summary", bridgev2.ErrIgnoringRemoteEvent)
+	}
 	return s.Client.Main.MsgConv.ToMatrix(ctx, portal, intent, s.Client.UserLogin, &s.Data.Msg), nil
 }
 

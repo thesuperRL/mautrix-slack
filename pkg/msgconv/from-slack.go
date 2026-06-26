@@ -169,6 +169,7 @@ func (mc *MessageConverter) EditToMatrix(
 }
 
 func (mc *MessageConverter) makeTextPart(ctx context.Context, msg *slack.Msg, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) *bridgev2.ConvertedMessagePart {
+	ctx = mc.ctxWithSlackReplyParent(ctx, portal, msg)
 	var text string
 	if msg.Text != "" {
 		text = msg.Text

@@ -180,6 +180,8 @@ var roomCaps = &event.RoomFeatures{
 	EditMaxAge:      nil,
 	Delete:          event.CapLevelFullySupported,
 	Reaction:        event.CapLevelFullySupported,
+	// Preserve Matrix HTML when relaying (e.g. Discord markdown → Slack rich text).
+	PerMessageProfileRelay: true,
 }
 
 var dmCaps *event.RoomFeatures

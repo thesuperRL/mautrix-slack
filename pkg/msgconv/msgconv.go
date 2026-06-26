@@ -18,6 +18,7 @@ package msgconv
 
 import (
 	"context"
+	"strings"
 	"net"
 	"net/http"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-slack/pkg/bridgeidentity"
 	"go.mau.fi/mautrix-slack/pkg/connector/slackdb"
 	"go.mau.fi/mautrix-slack/pkg/msgconv/matrixfmt"
 	"go.mau.fi/mautrix-slack/pkg/msgconv/mrkdwn"
@@ -50,6 +52,7 @@ type contextKey int
 const (
 	contextKeyPortal contextKey = iota
 	contextKeySource
+	contextKeySlackParentTS
 )
 
 type SlackClientProvider interface {
@@ -59,6 +62,14 @@ type SlackClientProvider interface {
 }
 
 func (mc *MessageConverter) GetMentionedUserInfo(ctx context.Context, userID string) (mxid id.UserID, name string) {
+	relayUID := mc.relaySlackUserID(ctx)
+	if relayUID != "" && strings.EqualFold(userID, relayUID) {
+		if parentMXID := mc.matrixSenderForSlackParent(ctx); parentMXID != "" {
+			if slackUID := bridgeidentity.SlackUserIDForMXID(parentMXID); slackUID != "" {
+				return mc.GetMentionedUserInfo(ctx, slackUID)
+			}
+		}
+	}
 	source := ctx.Value(contextKeySource).(*bridgev2.UserLogin)
 	teamID, loggedInUserID := slackid.ParseUserLoginID(source.ID)
 	ghost, err := mc.Bridge.GetGhostByID(ctx, slackid.MakeUserID(teamID, userID))
