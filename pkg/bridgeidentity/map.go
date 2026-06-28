@@ -429,34 +429,36 @@ func (m *Map) slackUserIDForMatrixLocalpart(localpart string, domain string) str
 	return m.matrixLocalpartSlack[localpart]
 }
 
-// DiscordIDForMXID returns a Discord user snowflake when mxid is a linked discord or slack ghost.
+// DiscordIDForMXID returns a Discord user snowflake when mxid is a discord or slack ghost,
+// or a Matrix user with Discord linked in governance. Uses governance data to map Slack→Discord.
 func DiscordIDForMXID(mxid id.UserID) string {
+	// Always return Discord ID for Discord ghosts, regardless of governance links
 	if discordID := ParseDiscordGhostMXID(mxid); discordID != "" {
-		if Get().HasDiscord(discordID) {
-			return discordID
-		}
-		return ""
+		return discordID
 	}
+	// For Slack ghosts, look up Discord ID via governance (cross-platform mapping)
 	if slackUID := ParseSlackGhostUserID(mxid); slackUID != "" {
 		return Get().DiscordIDForSlack(slackUID)
 	}
+	// For Matrix users, look up Discord ID via governance
 	if localpart, domain, err := mxid.Parse(); err == nil {
 		return Get().discordIDForMatrixLocalpart(localpart, domain)
 	}
 	return ""
 }
 
-// SlackUserIDForMXID returns a Slack user ID when mxid is a linked slack or discord ghost.
+// SlackUserIDForMXID returns a Slack user ID when mxid is a slack or discord ghost,
+// or a Matrix user with Slack linked in governance. Uses governance data to map Discord→Slack.
 func SlackUserIDForMXID(mxid id.UserID) string {
+	// Always return Slack ID for Slack ghosts, regardless of governance links
 	if slackUID := ParseSlackGhostUserID(mxid); slackUID != "" {
-		if Get().HasSlack(slackUID) {
-			return slackUID
-		}
-		return ""
+		return slackUID
 	}
+	// For Discord ghosts, look up Slack ID via governance (cross-platform mapping)
 	if discordID := ParseDiscordGhostMXID(mxid); discordID != "" {
 		return Get().SlackUserIDForDiscord(discordID)
 	}
+	// For Matrix users, look up Slack ID via governance
 	if localpart, domain, err := mxid.Parse(); err == nil {
 		return Get().slackUserIDForMatrixLocalpart(localpart, domain)
 	}
