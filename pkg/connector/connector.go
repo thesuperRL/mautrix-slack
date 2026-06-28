@@ -21,6 +21,7 @@ import (
 
 	"maunium.net/go/mautrix/bridgev2"
 
+	"go.mau.fi/mautrix-slack/pkg/bridgeidentity"
 	"go.mau.fi/mautrix-slack/pkg/connector/slackdb"
 	"go.mau.fi/mautrix-slack/pkg/msgconv"
 )
@@ -49,6 +50,9 @@ func (s *SlackConnector) SetMaxFileSize(maxSize int64) {
 }
 
 func (s *SlackConnector) Start(ctx context.Context) error {
+	// Warm the identity cache so the first cross-bridge mention doesn't block the
+	// message-send path on a synchronous Keycloak crawl (matches mautrix-discord).
+	go bridgeidentity.Get()
 	return s.DB.Upgrade(ctx)
 }
 
