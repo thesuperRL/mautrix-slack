@@ -52,6 +52,106 @@ discord = "DTEAM"
 	}
 }
 
+func TestMirrorTargetRoleDefaultsToTeamName(t *testing.T) {
+	team := &TeamInfo{TeamName: "Terrier"}
+	if team.MirrorTargetRole() != "Terrier" {
+		t.Fatalf("expected default team name, got %q", team.MirrorTargetRole())
+	}
+	if !team.RoleMirrorsToChannel("terrier") {
+		t.Fatalf("default team role should mirror case-insensitively")
+	}
+}
+
+func TestLoadChannelMirrorConfig(t *testing.T) {
+	dir := t.TempDir()
+	teamsDir := filepath.Join(dir, "teams")
+	if err := os.MkdirAll(teamsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(teamsDir, "custom.toml"), []byte(`
+[team]
+name = "Custom Team"
+slug = "custom"
+
+[[team.channels]]
+slack = "CCUSTOM"
+discord = "DCUSTOM"
+mirror_role = "Developers"
+
+[[team.channels]]
+slack = "CEVERY"
+discord = "DEVERY"
+mirror_everyone = true
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := load(dir)
+	custom := d.TeamForDiscordChannel("DCUSTOM")
+	if custom == nil || custom.MirrorRole != "Developers" || custom.MirrorTargetRole() != "Developers" {
+		t.Fatalf("custom mirror role: %#v", custom)
+	}
+	if !custom.RoleMirrorsToChannel("Developers") || custom.RoleMirrorsToChannel("Custom Team") {
+		t.Fatalf("custom role should mirror Developers only")
+	}
+	every := d.TeamForDiscordChannel("DEVERY")
+	if every == nil || !every.MirrorEveryone {
+		t.Fatalf("mirror_everyone: %#v", every)
+	}
+	if every.RoleMirrorsToChannel("Custom Team") {
+		t.Fatalf("mirror_everyone channels should not mirror role pings")
+	}
+}
+
+func TestLoadMembersAndForgejoURL(t *testing.T) {
+	dir := t.TempDir()
+	teamsDir := filepath.Join(dir, "teams")
+	if err := os.MkdirAll(teamsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "org.toml"), []byte(`
+[org.forgejo]
+org = "ScottyLabs"
+url = "https://codeberg.org"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(teamsDir, "devops.toml"), []byte(`
+[team]
+name = "DevOps"
+slug = "devops"
+leads = ["anish", "thesuperrl"]
+members = ["xboxbedrock"]
+
+[[team.projects]]
+name = "Quest"
+slug = "quest"
+leads = ["alice"]
+members = ["bob"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := load(dir)
+	if d.ForgejoURL() != "https://codeberg.org" {
+		t.Fatalf("forgejo url: %q", d.ForgejoURL())
+	}
+	members := d.AllMembers()
+	if len(members) != 5 {
+		t.Fatalf("expected 5 members, got %v", members)
+	}
+	want := map[string]bool{"anish": true, "thesuperrl": true, "xboxbedrock": true, "alice": true, "bob": true}
+	for _, m := range members {
+		if !want[m] {
+			t.Fatalf("unexpected member %q", m)
+		}
+		delete(want, m)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing members: %v", want)
+	}
+}
+
 func TestLoadTeamReposDoNotOverwriteTeamName(t *testing.T) {
 	dir := t.TempDir()
 	teamsDir := filepath.Join(dir, "teams")

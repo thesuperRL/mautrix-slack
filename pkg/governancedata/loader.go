@@ -17,6 +17,27 @@ type TeamInfo struct {
 	TeamName         string
 	SlackChannelID   string
 	DiscordChannelID string
+	MirrorRole       string
+	MirrorEveryone   bool
+}
+
+// MirrorTargetRole returns the Discord role name that mirrors @channel for this channel.
+func (t *TeamInfo) MirrorTargetRole() string {
+	if t == nil {
+		return ""
+	}
+	if t.MirrorRole != "" {
+		return t.MirrorRole
+	}
+	return t.TeamName
+}
+
+// RoleMirrorsToChannel reports whether pinging roleName in this channel should mirror to @channel.
+func (t *TeamInfo) RoleMirrorsToChannel(roleName string) bool {
+	if t == nil || t.MirrorEveryone || roleName == "" {
+		return false
+	}
+	return strings.EqualFold(roleName, t.MirrorTargetRole())
 }
 
 // Data holds runtime governance channel ownership lookups.
@@ -25,6 +46,30 @@ type Data struct {
 	discordToTeam map[string]*TeamInfo
 	orgSlack      map[string]bool
 	orgDiscord    map[string]bool
+	members       map[string]bool
+	forgejoURL    string
+}
+
+const defaultForgejoURL = "https://codeberg.org"
+
+// AllMembers returns deduped Codeberg usernames from team and project leads/members.
+func (d *Data) AllMembers() []string {
+	if d == nil || len(d.members) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(d.members))
+	for u := range d.members {
+		out = append(out, u)
+	}
+	return out
+}
+
+// ForgejoURL returns the Forgejo/Codeberg API base URL from org.toml.
+func (d *Data) ForgejoURL() string {
+	if d == nil || d.forgejoURL == "" {
+		return defaultForgejoURL
+	}
+	return d.forgejoURL
 }
 
 var (
@@ -90,6 +135,7 @@ func emptyData() *Data {
 		discordToTeam: make(map[string]*TeamInfo),
 		orgSlack:      make(map[string]bool),
 		orgDiscord:    make(map[string]bool),
+		members:       make(map[string]bool),
 	}
 }
 
@@ -100,6 +146,7 @@ func load(path string) *Data {
 		return d
 	}
 	_ = loadOrg(filepath.Join(path, "org.toml"), d)
+	_ = loadOrgForgejo(filepath.Join(path, "org.toml"), d)
 	entries, err := os.ReadDir(filepath.Join(path, "teams"))
 	if err != nil {
 		return d
@@ -164,6 +211,30 @@ func parseOrgCommKey(line string, d *Data) {
 	}
 }
 
+func loadOrgForgejo(path string, d *Data) error {
+	lines, err := readLines(path)
+	if err != nil {
+		return err
+	}
+	inForgejo := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch trimmed {
+		case "[org.forgejo]":
+			inForgejo = true
+		case "[org]", "[org.github]", "[org.keycloak]", "[org.communication]":
+			inForgejo = false
+		default:
+			if inForgejo {
+				if val, ok := parseAssignment(trimmed, "url"); ok {
+					d.forgejoURL = val
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func loadTeam(path string, d *Data) error {
 	lines, err := readLines(path)
 	if err != nil {
@@ -171,6 +242,7 @@ func loadTeam(path string, d *Data) error {
 	}
 	var slug, name string
 	inTeamHeader := false
+	inProject := false
 	inChannelTable := false
 	var channel slackDiscordPair
 	for _, line := range lines {
@@ -178,9 +250,15 @@ func loadTeam(path string, d *Data) error {
 		switch trimmed {
 		case "[team]":
 			inTeamHeader = true
+			inProject = false
 			inChannelTable = false
-		case "[[team.projects]]", "[[team.repos]]":
+		case "[[team.projects]]":
 			inTeamHeader = false
+			inProject = true
+			inChannelTable = false
+		case "[[team.repos]]":
+			inTeamHeader = false
+			inProject = false
 			inChannelTable = false
 		case "[[team.channels]]", "[[team.projects.channels]]":
 			flushTeamChannel(d, slug, name, &channel)
@@ -188,11 +266,19 @@ func loadTeam(path string, d *Data) error {
 		default:
 			if inChannelTable {
 				parseChannelPair(trimmed, &channel)
-			} else if inTeamHeader {
-				if val, ok := parseAssignment(trimmed, "slug"); ok {
+			} else if inTeamHeader || inProject {
+				if val, ok := parseAssignment(trimmed, "slug"); ok && inTeamHeader {
 					slug = val
-				} else if val, ok := parseAssignment(trimmed, "name"); ok {
+				} else if val, ok := parseAssignment(trimmed, "name"); ok && inTeamHeader {
 					name = val
+				} else if users, ok := parseStringArrayAssignment(trimmed, "leads"); ok {
+					for _, u := range users {
+						d.members[u] = true
+					}
+				} else if users, ok := parseStringArrayAssignment(trimmed, "members"); ok {
+					for _, u := range users {
+						d.members[u] = true
+					}
 				}
 			}
 		}
@@ -202,8 +288,10 @@ func loadTeam(path string, d *Data) error {
 }
 
 type slackDiscordPair struct {
-	slack   string
-	discord string
+	slack          string
+	discord        string
+	mirrorRole     string
+	mirrorEveryone bool
 }
 
 func parseChannelPair(line string, channel *slackDiscordPair) {
@@ -212,6 +300,12 @@ func parseChannelPair(line string, channel *slackDiscordPair) {
 	}
 	if val, ok := parseAssignment(line, "discord"); ok {
 		channel.discord = val
+	}
+	if val, ok := parseAssignment(line, "mirror_role"); ok {
+		channel.mirrorRole = val
+	}
+	if val, ok := parseBoolAssignment(line, "mirror_everyone"); ok {
+		channel.mirrorEveryone = val
 	}
 }
 
@@ -235,6 +329,8 @@ func flushTeamChannel(d *Data, slug, name string, channel *slackDiscordPair) {
 		TeamName:         name,
 		SlackChannelID:   strings.ToUpper(channel.slack),
 		DiscordChannelID: channel.discord,
+		MirrorRole:       channel.mirrorRole,
+		MirrorEveryone:   channel.mirrorEveryone,
 	}
 	if channel.slack != "" {
 		d.slackToTeam[strings.ToUpper(channel.slack)] = info
@@ -255,6 +351,39 @@ func parseAssignment(line, key string) (string, bool) {
 		return val[1 : len(val)-1], true
 	}
 	return "", false
+}
+
+func parseBoolAssignment(line, key string) (bool, bool) {
+	prefix := key + " = "
+	if !strings.HasPrefix(line, prefix) {
+		return false, false
+	}
+	val := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	return val == "true", true
+}
+
+func parseStringArrayAssignment(line, key string) ([]string, bool) {
+	prefix := key + " = "
+	if !strings.HasPrefix(line, prefix) {
+		return nil, false
+	}
+	val := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	if !strings.HasPrefix(val, "[") || !strings.HasSuffix(val, "]") {
+		return nil, false
+	}
+	inner := strings.TrimSpace(val[1 : len(val)-1])
+	if inner == "" {
+		return nil, true
+	}
+	parts := strings.Split(inner, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+			out = append(out, part[1:len(part)-1])
+		}
+	}
+	return out, true
 }
 
 func readLines(path string) ([]string, error) {

@@ -9,11 +9,14 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/mautrix-slack/pkg/governancedata"
 )
 
 const defaultRefreshInterval = 60 * time.Second
@@ -143,13 +146,41 @@ func loadFromKeycloak() (*Map, error) {
 	m := emptyMap()
 	m.matrixDomain = os.Getenv("MATRIX_DOMAIN")
 
+	gov := governancedata.Get()
+	for _, username := range gov.AllMembers() {
+		loadGovernanceMember(m, baseURL, realm, token, gov.ForgejoURL(), username)
+	}
+	if err := loadFromKeycloakScan(m, baseURL, realm, token); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func loadGovernanceMember(m *Map, baseURL, realm, token, forgejoURL, username string) {
+	codebergID, err := forgejoUserID(forgejoURL, username)
+	if err != nil || codebergID == "" {
+		return
+	}
+	kcUser, err := keycloakUserByCodebergID(baseURL, realm, token, codebergID)
+	if err != nil || kcUser == nil {
+		return
+	}
+	fedURL := fmt.Sprintf("%s/admin/realms/%s/users/%s/federated-identity", baseURL, url.PathEscape(realm), url.PathEscape(kcUser.ID))
+	var fed []keycloakFedLink
+	if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
+		return
+	}
+	indexFederatedLinks(m, fed, kcUser.Username)
+}
+
+func loadFromKeycloakScan(m *Map, baseURL, realm, token string) error {
 	first := 0
 	const pageSize = 100
 	for {
 		usersURL := fmt.Sprintf("%s/admin/realms/%s/users?first=%d&max=%d", baseURL, url.PathEscape(realm), first, pageSize)
 		var users []keycloakUser
 		if err := keycloakGetJSON(usersURL, token, &users); err != nil {
-			return nil, err
+			return err
 		}
 		if len(users) == 0 {
 			break
@@ -164,19 +195,7 @@ func loadFromKeycloak() (*Map, error) {
 			if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
 				continue
 			}
-			discordID := federatedDiscordID(fed)
-			slackID := federatedSlackUserID(fed)
-			matrixLocalpart := strings.ToLower(federatedMatrixLocalpart(fed, user.Username))
-			if slackID == "" || matrixLocalpart == "" {
-				continue
-			}
-			m.matrixLocalpartSlack[matrixLocalpart] = slackID
-			m.slackToMatrixLocalpart[slackID] = matrixLocalpart
-			if discordID != "" {
-				m.discordToSlack[discordID] = slackID
-				m.slackToDiscord[slackID] = discordID
-				m.matrixLocalpartDiscord[matrixLocalpart] = discordID
-			}
+			indexFederatedLinks(m, fed, user.Username)
 		}
 
 		if len(users) < pageSize {
@@ -184,8 +203,65 @@ func loadFromKeycloak() (*Map, error) {
 		}
 		first += pageSize
 	}
+	return nil
+}
 
-	return m, nil
+func indexFederatedLinks(m *Map, fed []keycloakFedLink, keycloakUsername string) {
+	discordID := federatedDiscordID(fed)
+	slackID := federatedSlackUserID(fed)
+	matrixLocalpart := strings.ToLower(federatedMatrixLocalpart(fed, keycloakUsername))
+	if slackID != "" && discordID != "" {
+		m.discordToSlack[discordID] = slackID
+		m.slackToDiscord[slackID] = discordID
+	}
+	if slackID != "" && matrixLocalpart != "" {
+		m.matrixLocalpartSlack[matrixLocalpart] = slackID
+		m.slackToMatrixLocalpart[slackID] = matrixLocalpart
+	}
+	if discordID != "" && matrixLocalpart != "" {
+		m.matrixLocalpartDiscord[matrixLocalpart] = discordID
+	}
+}
+
+func forgejoUserID(forgejoURL, username string) (string, error) {
+	apiURL := fmt.Sprintf("%s/api/v1/users/%s", strings.TrimRight(forgejoURL, "/"), url.PathEscape(username))
+	resp, err := httpClient.Get(apiURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("forgejo GET %s: HTTP %d", apiURL, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.ID == 0 {
+		return "", fmt.Errorf("forgejo user %s has no id", username)
+	}
+	return strconv.FormatInt(parsed.ID, 10), nil
+}
+
+func keycloakUserByCodebergID(baseURL, realm, token, codebergID string) (*keycloakUser, error) {
+	usersURL := fmt.Sprintf(
+		"%s/admin/realms/%s/users?idpAlias=codeberg&idpUserId=%s",
+		baseURL, url.PathEscape(realm), url.PathEscape(codebergID),
+	)
+	var users []keycloakUser
+	if err := keycloakGetJSON(usersURL, token, &users); err != nil {
+		return nil, err
+	}
+	if len(users) == 0 || users[0].ID == "" {
+		return nil, fmt.Errorf("no keycloak user for codeberg id %s", codebergID)
+	}
+	return &users[0], nil
 }
 
 func keycloakToken(baseURL, realm, clientID, clientSecret string) (string, error) {
@@ -357,7 +433,6 @@ func (m *Map) HasDiscord(discordID string) bool {
 func (m *Map) HasSlack(slackUserID string) bool {
 	return m.DiscordIDForSlack(slackUserID) != ""
 }
-
 
 // LinkedIdentityKey returns a stable dedup key for the same person across Discord/Slack puppets.
 func LinkedIdentityKey(mxid id.UserID) string {

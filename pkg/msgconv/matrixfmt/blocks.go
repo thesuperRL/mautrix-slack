@@ -118,6 +118,35 @@ func New2(br *bridgev2.Bridge, db *slackdb.SlackDB) *HTMLParser {
 	return &HTMLParser{br: br, db: db}
 }
 
+var matrixUserLinkRegex = regexp.MustCompile(`<a\b[^>]*href="(https://matrix\.to/#/@[^"]+)"[^>]*>([^<]*)</a>`)
+
+// ToSlackComment converts Matrix HTML mentions to Slack mrkdwn user pings for file upload comments.
+func (parser *HTMLParser) ToSlackComment(ctx context.Context, formattedBody string, mentions *event.Mentions, portal *bridgev2.Portal, replyToUser id.UserID) string {
+	if formattedBody == "" {
+		return ""
+	}
+	mctx := Context{
+		Ctx:         ctx,
+		Portal:      portal,
+		Mentions:    mentions,
+		ReplyToUser: replyToUser,
+	}
+	return matrixUserLinkRegex.ReplaceAllStringFunc(formattedBody, func(match string) string {
+		sub := matrixUserLinkRegex.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		parsed, _ := id.ParseMatrixURIOrMatrixToURL(sub[1])
+		if parsed == nil || parsed.Sigil1 != '@' {
+			return sub[2]
+		}
+		if slackUID := parser.GetMentionedUserID(parsed.UserID(), mctx); slackUID != "" {
+			return fmt.Sprintf("<@%s>", slackUID)
+		}
+		return sub[2]
+	})
+}
+
 func (parser *HTMLParser) GetMentionedUserID(mxid id.UserID, ctx Context) string {
 	if slackUserID := bridgeidentity.SlackUserIDForMXID(mxid); slackUserID != "" {
 		return ctx.trackSlackMention(slackUserID)

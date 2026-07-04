@@ -78,6 +78,16 @@ func replaceMatrixUserMentionHTML(formattedBody string, userID id.UserID, label 
 	return re.ReplaceAllString(formattedBody, escapedLabel)
 }
 
+func (mc *MessageConverter) prepareMatrixMentionsForSlack(ctx context.Context, portal *bridgev2.Portal, content *event.MessageEventContent, origSender *bridgev2.OrigSender) {
+	if origSender != nil {
+		appendLinkPreviewURLs(content, content.BeeperLinkPreviews)
+	}
+	if content.Mentions != nil {
+		content.Mentions.UserIDs = bridgeidentity.DedupeLinkedMentions(content.Mentions.UserIDs)
+	}
+	mc.replaceMatrixMentionsWithLabels(ctx, portal, content)
+}
+
 func (mc *MessageConverter) replaceMatrixMentionsWithLabels(ctx context.Context, portal *bridgev2.Portal, content *event.MessageEventContent) {
 	if content.Mentions == nil {
 		return
@@ -213,13 +223,7 @@ func (mc *MessageConverter) ToSlack(
 
 	switch content.MsgType {
 	case event.MsgText, event.MsgEmote, event.MsgNotice:
-		if origSender != nil {
-			appendLinkPreviewURLs(content, content.BeeperLinkPreviews)
-			if content.Mentions != nil {
-				content.Mentions.UserIDs = bridgeidentity.DedupeLinkedMentions(content.Mentions.UserIDs)
-			}
-			mc.replaceMatrixMentionsWithLabels(ctx, portal, content)
-		}
+		mc.prepareMatrixMentionsForSlack(ctx, portal, content, origSender)
 		replyToUser := mc.matrixReplyToUser(ctx, content)
 		options := make([]slack.MsgOption, 0, 4)
 		var block slack.Block
@@ -277,6 +281,8 @@ func (mc *MessageConverter) ToSlack(
 			}
 		}
 		_, channelID := slackid.ParsePortalID(portal.ID)
+		mc.prepareMatrixMentionsForSlack(ctx, portal, content, origSender)
+		replyToUser := mc.matrixReplyToUser(ctx, content)
 		if !isRealUser {
 			fileUpload := &slack.UploadFileV2Parameters{
 				Filename:        filename,
@@ -285,7 +291,11 @@ func (mc *MessageConverter) ToSlack(
 				Channel:         channelID,
 				ThreadTimestamp: threadRootID,
 			}
-			if comment := relaySlackUploadInitialComment(origSender, caption); comment != "" {
+			comment := caption
+			if captionHTML != "" {
+				comment = mc.MatrixHTMLParser.ToSlackComment(ctx, content.FormattedBody, content.Mentions, portal, replyToUser)
+			}
+			if comment = relaySlackUploadInitialComment(origSender, comment); comment != "" {
 				fileUpload.InitialComment = comment
 			}
 			return &ConvertedSlackMessage{FileUpload: fileUpload}, nil
@@ -311,7 +321,7 @@ func (mc *MessageConverter) ToSlack(
 			}
 			var block slack.Block
 			if captionHTML != "" {
-				block = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal, mc.matrixReplyToUser(ctx, content))
+				block = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal, replyToUser)
 			} else if caption != "" {
 				block = slack.NewRichTextBlock("", slack.NewRichTextSection(slack.NewRichTextSectionTextElement(caption, nil)))
 			}
