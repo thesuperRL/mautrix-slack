@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -111,6 +112,7 @@ func Get() *Map {
 	if m, err := loadFromKeycloak(); err == nil {
 		globalMap = m
 	} else {
+		log.Printf("bridgeidentity: keycloak load failed: %v", err)
 		globalMap = emptyMap()
 	}
 	loadedAt = time.Now()
@@ -150,9 +152,8 @@ func loadFromKeycloak() (*Map, error) {
 	for _, username := range gov.AllMembers() {
 		loadGovernanceMember(m, baseURL, realm, token, gov.ForgejoURL(), username)
 	}
-	if err := loadFromKeycloakScan(m, baseURL, realm, token); err != nil {
-		return nil, err
-	}
+	loadFromKeycloakScan(m, baseURL, realm, token)
+	log.Printf("bridgeidentity: loaded %d cross-platform links", len(m.discordToSlack))
 	return m, nil
 }
 
@@ -180,7 +181,8 @@ func loadFromKeycloakScan(m *Map, baseURL, realm, token string) error {
 		usersURL := fmt.Sprintf("%s/admin/realms/%s/users?first=%d&max=%d", baseURL, url.PathEscape(realm), first, pageSize)
 		var users []keycloakUser
 		if err := keycloakGetJSON(usersURL, token, &users); err != nil {
-			return err
+			log.Printf("bridgeidentity: keycloak user scan stopped at first=%d: %v", first, err)
+			break
 		}
 		if len(users) == 0 {
 			break

@@ -143,7 +143,7 @@ func (parser *HTMLParser) ToSlackComment(ctx context.Context, formattedBody stri
 		if slackUID := parser.GetMentionedUserID(parsed.UserID(), mctx); slackUID != "" {
 			return fmt.Sprintf("<@%s>", slackUID)
 		}
-		return sub[2]
+		return "[" + sub[2] + "]"
 	})
 }
 
