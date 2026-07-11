@@ -103,6 +103,58 @@ mirror_everyone = true
 	}
 }
 
+func TestLoadOrgChannelMirrorConfig(t *testing.T) {
+	dir := t.TempDir()
+	teamsDir := filepath.Join(dir, "teams")
+	if err := os.MkdirAll(teamsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "org.toml"), []byte(`
+[org.communication]
+slack_hub_channel_id = "CHUB"
+discord_hub_channel_id = "DHUB"
+
+[[org.communication.channels]]
+name = "Announcements"
+slug = "announcements"
+slack = "CANN"
+discord = "DANN"
+mirror_everyone = true
+
+[[org.communication.channels]]
+name = "Random"
+slug = "random"
+slack = "CRAND"
+discord = "DRAND"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := load(dir)
+
+	ann := d.MirrorConfigForSlackChannel("CANN")
+	if ann == nil || !ann.MirrorEveryone {
+		t.Fatalf("announcements mirror_everyone: %#v", ann)
+	}
+	if d.MirrorConfigForDiscordChannel("DANN") != ann {
+		t.Fatalf("discord announcements lookup mismatch")
+	}
+	if ann.RoleMirrorsToChannel("Announcements") {
+		t.Fatalf("mirror_everyone org channels should not mirror role pings")
+	}
+
+	rand := d.MirrorConfigForSlackChannel("CRAND")
+	if rand == nil || rand.MirrorEveryone {
+		t.Fatalf("random channel should have no mirror_everyone: %#v", rand)
+	}
+
+	// Hub channel (no mirror config) registers but stays mirror-inert.
+	hub := d.MirrorConfigForSlackChannel("CHUB")
+	if hub == nil || hub.MirrorEveryone || hub.MirrorTargetRole() != "" {
+		t.Fatalf("hub channel should be inert: %#v", hub)
+	}
+}
+
 func TestLoadMembersAndForgejoURL(t *testing.T) {
 	dir := t.TempDir()
 	teamsDir := filepath.Join(dir, "teams")
@@ -149,6 +201,19 @@ members = ["bob"]
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing members: %v", want)
+	}
+
+	// Project members roll up into the parent team, matching governance-tfgen's Discord
+	// role assignment (all team members, including project members, get the team role).
+	devopsMembers := map[string]bool{}
+	for _, m := range d.TeamMembers("devops") {
+		devopsMembers[m] = true
+	}
+	if len(devopsMembers) != 5 || !devopsMembers["anish"] || !devopsMembers["thesuperrl"] || !devopsMembers["xboxbedrock"] || !devopsMembers["alice"] || !devopsMembers["bob"] {
+		t.Fatalf("devops team members: %v", devopsMembers)
+	}
+	if got := d.TeamMembers("nonexistent"); got != nil {
+		t.Fatalf("expected nil for unknown team, got %v", got)
 	}
 }
 

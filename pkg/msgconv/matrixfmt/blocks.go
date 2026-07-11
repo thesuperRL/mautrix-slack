@@ -184,6 +184,38 @@ func (parser *HTMLParser) GetMentionedUserID(mxid id.UserID, ctx Context) string
 	return ""
 }
 
+// teamRolePingMemberElements expands a mirrored role ping into individual member mentions,
+// labelled so it's clear the ping came from a Discord team role, not a literal @channel.
+// Org channels (Announcements/General) have no team slug/members, so this is a no-op there —
+// only real team channels expand into per-member pings.
+func (parser *HTMLParser) teamRolePingMemberElements(team *governancedata.TeamInfo, ctx Context) []slack.RichTextSectionElement {
+	if team == nil || team.TeamSlug == "" {
+		return nil
+	}
+	usernames := governancedata.Get().TeamMembers(team.TeamSlug)
+	if len(usernames) == 0 {
+		return nil
+	}
+	identity := bridgeidentity.Get()
+	var mentions []slack.RichTextSectionElement
+	for _, username := range usernames {
+		if slackUserID := identity.SlackUserIDForGovernanceUsername(username); slackUserID != "" {
+			if len(mentions) > 0 {
+				mentions = append(mentions, slack.NewRichTextSectionTextElement(" ", ctx.StylePtr()))
+			}
+			mentions = append(mentions, slack.NewRichTextSectionUserElement(slackUserID, ctx.StylePtr()))
+		}
+	}
+	if len(mentions) == 0 {
+		return nil
+	}
+	label := fmt.Sprintf(" (%s team ping: ", team.TeamName)
+	elems := []slack.RichTextSectionElement{slack.NewRichTextSectionTextElement(label, ctx.StylePtr())}
+	elems = append(elems, mentions...)
+	elems = append(elems, slack.NewRichTextSectionTextElement(")", ctx.StylePtr()))
+	return elems
+}
+
 func (parser *HTMLParser) GetMentionedChannelID(mxid id.RoomID, ctx Context) string {
 	portal, err := parser.br.GetPortalByMXID(ctx.Ctx, mxid)
 	if err != nil {
@@ -453,14 +485,17 @@ func (parser *HTMLParser) textToElements(text string, ctx Context) []slack.RichT
 		}
 		if part == "@room" {
 			// Convert a room ping to a real Slack @channel broadcast only when
-			// governance says this channel belongs to a team. Org-wide / unlinked
-			// channels get inert "@channel" text so they don't blast the channel.
+			// governance says this channel belongs to a team or is a mirror-enabled org
+			// channel (e.g. Announcements/General). Unlinked channels get inert
+			// "@channel" text so they don't blast the channel.
 			var channelID string
 			if ctx.Portal != nil {
 				_, channelID = slackid.ParsePortalID(ctx.Portal.ID)
 			}
-			if channelID != "" && governancedata.Get().TeamForSlackChannel(channelID) != nil {
+			team := governancedata.Get().MirrorConfigForSlackChannel(channelID)
+			if channelID != "" && team != nil {
 				elems = append(elems, slack.NewRichTextSectionBroadcastElement(slack.RichTextBroadcastRangeChannel))
+				elems = append(elems, parser.teamRolePingMemberElements(team, ctx)...)
 			} else {
 				elems = append(elems, parser.textToElement("@channel", ctx))
 			}

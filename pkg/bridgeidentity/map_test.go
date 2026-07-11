@@ -55,7 +55,7 @@ func TestIndexFederatedLinksRequiresBothPlatformsForCrossMap(t *testing.T) {
 		{IdentityProvider: "slack", UserID: "U03SLACK"},
 		{IdentityProvider: "discord", UserID: "333444555666777888"},
 		{IdentityProvider: "codeberg", UserName: "member"},
-	}, "member")
+	}, "member", "govmember")
 
 	if m.SlackUserIDForDiscord("333444555666777888") != "U03SLACK" {
 		t.Fatalf("cross-map missing")
@@ -65,5 +65,12 @@ func TestIndexFederatedLinksRequiresBothPlatformsForCrossMap(t *testing.T) {
 	}
 	if m.SlackUserIDForMatrixLocalpart("member", "example.org") != "U03SLACK" {
 		t.Fatalf("matrix localpart map missing")
+	}
+	m.matrixDomain = "example.org"
+	if got := m.MXIDForGovernanceUsername("GovMember"); got != "@member:example.org" {
+		t.Fatalf("governance username MXID lookup: %q", got)
+	}
+	if got := m.MXIDForGovernanceUsername("nonexistent"); got != "" {
+		t.Fatalf("expected empty MXID for unlinked username, got %q", got)
 	}
 }

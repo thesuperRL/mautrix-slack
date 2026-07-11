@@ -30,6 +30,7 @@ type Map struct {
 	matrixLocalpartDiscord map[string]string
 	matrixLocalpartSlack   map[string]string
 	slackToMatrixLocalpart map[string]string
+	usernameToMatrixLocal  map[string]string
 }
 
 type keycloakFedLink struct {
@@ -128,6 +129,7 @@ func emptyMap() *Map {
 		matrixLocalpartDiscord: make(map[string]string),
 		matrixLocalpartSlack:   make(map[string]string),
 		slackToMatrixLocalpart: make(map[string]string),
+		usernameToMatrixLocal:  make(map[string]string),
 	}
 }
 
@@ -171,7 +173,7 @@ func loadGovernanceMember(m *Map, baseURL, realm, token, forgejoURL, username st
 	if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
 		return
 	}
-	indexFederatedLinks(m, fed, kcUser.Username)
+	indexFederatedLinks(m, fed, kcUser.Username, username)
 }
 
 func loadFromKeycloakScan(m *Map, baseURL, realm, token string) error {
@@ -197,7 +199,7 @@ func loadFromKeycloakScan(m *Map, baseURL, realm, token string) error {
 			if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
 				continue
 			}
-			indexFederatedLinks(m, fed, user.Username)
+			indexFederatedLinks(m, fed, user.Username, "")
 		}
 
 		if len(users) < pageSize {
@@ -208,7 +210,11 @@ func loadFromKeycloakScan(m *Map, baseURL, realm, token string) error {
 	return nil
 }
 
-func indexFederatedLinks(m *Map, fed []keycloakFedLink, keycloakUsername string) {
+// indexFederatedLinks indexes a Keycloak user's linked Discord/Slack/Matrix identities.
+// governanceUsername is the Codeberg/governance username driving this lookup (only set
+// from the governance-member path, not the full-scan path) — used to key
+// usernameToMatrixLocal for team-role-ping → individual-member-mention expansion.
+func indexFederatedLinks(m *Map, fed []keycloakFedLink, keycloakUsername string, governanceUsername string) {
 	discordID := federatedDiscordID(fed)
 	slackID := federatedSlackUserID(fed)
 	matrixLocalpart := strings.ToLower(federatedMatrixLocalpart(fed, keycloakUsername))
@@ -222,6 +228,9 @@ func indexFederatedLinks(m *Map, fed []keycloakFedLink, keycloakUsername string)
 	}
 	if discordID != "" && matrixLocalpart != "" {
 		m.matrixLocalpartDiscord[matrixLocalpart] = discordID
+	}
+	if governanceUsername != "" && matrixLocalpart != "" {
+		m.usernameToMatrixLocal[strings.ToLower(governanceUsername)] = matrixLocalpart
 	}
 }
 
@@ -426,6 +435,34 @@ func (m *Map) MatrixLocalpartForSlack(slackUserID string) string {
 // SlackUserIDForMatrixLocalpart returns the linked Slack member ID for a Matrix localpart.
 func (m *Map) SlackUserIDForMatrixLocalpart(localpart, domain string) string {
 	return m.slackUserIDForMatrixLocalpart(localpart, domain)
+}
+
+// MXIDForGovernanceUsername returns the Matrix user ID for a governance (Codeberg) username,
+// if that member is linked via Keycloak federated identity. Used to expand a team role ping
+// into individual member mentions.
+func (m *Map) MXIDForGovernanceUsername(username string) id.UserID {
+	if m == nil || username == "" || m.matrixDomain == "" {
+		return ""
+	}
+	localpart := m.usernameToMatrixLocal[strings.ToLower(username)]
+	if localpart == "" {
+		return ""
+	}
+	return id.NewUserID(localpart, m.matrixDomain)
+}
+
+// SlackUserIDForGovernanceUsername returns the Slack user ID for a governance (Codeberg)
+// username, if that member is linked via Keycloak federated identity. Used to expand a team
+// role ping into individual member mentions.
+func (m *Map) SlackUserIDForGovernanceUsername(username string) string {
+	if m == nil || username == "" {
+		return ""
+	}
+	localpart := m.usernameToMatrixLocal[strings.ToLower(username)]
+	if localpart == "" {
+		return ""
+	}
+	return m.matrixLocalpartSlack[localpart]
 }
 
 func (m *Map) HasDiscord(discordID string) bool {

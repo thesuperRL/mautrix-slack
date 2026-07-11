@@ -44,10 +44,19 @@ func (t *TeamInfo) RoleMirrorsToChannel(roleName string) bool {
 type Data struct {
 	slackToTeam   map[string]*TeamInfo
 	discordToTeam map[string]*TeamInfo
-	orgSlack      map[string]bool
-	orgDiscord    map[string]bool
+	orgSlack      map[string]*TeamInfo
+	orgDiscord    map[string]*TeamInfo
 	members       map[string]bool
+	teamMembers   map[string][]string
 	forgejoURL    string
+}
+
+// TeamMembers returns the Codeberg usernames (leads+members) for a team slug.
+func (d *Data) TeamMembers(slug string) []string {
+	if d == nil || slug == "" {
+		return nil
+	}
+	return d.teamMembers[slug]
 }
 
 const defaultForgejoURL = "https://codeberg.org"
@@ -133,9 +142,10 @@ func emptyData() *Data {
 	return &Data{
 		slackToTeam:   make(map[string]*TeamInfo),
 		discordToTeam: make(map[string]*TeamInfo),
-		orgSlack:      make(map[string]bool),
-		orgDiscord:    make(map[string]bool),
+		orgSlack:      make(map[string]*TeamInfo),
+		orgDiscord:    make(map[string]*TeamInfo),
 		members:       make(map[string]bool),
+		teamMembers:   make(map[string][]string),
 	}
 }
 
@@ -203,9 +213,9 @@ func parseOrgCommKey(line string, d *Data) {
 		if val, ok := parseAssignment(line, key); ok {
 			switch key {
 			case "slack_hub_channel_id", "slack_leads_channel_id":
-				d.orgSlack[strings.ToUpper(val)] = true
+				d.orgSlack[strings.ToUpper(val)] = &TeamInfo{}
 			case "discord_hub_channel_id", "discord_leads_channel_id":
-				d.orgDiscord[val] = true
+				d.orgDiscord[val] = &TeamInfo{}
 			}
 		}
 	}
@@ -241,6 +251,7 @@ func loadTeam(path string, d *Data) error {
 		return err
 	}
 	var slug, name string
+	var localMembers []string
 	inTeamHeader := false
 	inProject := false
 	inChannelTable := false
@@ -274,20 +285,27 @@ func loadTeam(path string, d *Data) error {
 				} else if users, ok := parseStringArrayAssignment(trimmed, "leads"); ok {
 					for _, u := range users {
 						d.members[u] = true
+						localMembers = append(localMembers, u)
 					}
 				} else if users, ok := parseStringArrayAssignment(trimmed, "members"); ok {
 					for _, u := range users {
 						d.members[u] = true
+						localMembers = append(localMembers, u)
 					}
 				}
 			}
 		}
 	}
 	flushTeamChannel(d, slug, name, &channel)
+	if slug != "" && len(localMembers) > 0 {
+		d.teamMembers[slug] = append(d.teamMembers[slug], localMembers...)
+	}
 	return nil
 }
 
 type slackDiscordPair struct {
+	name           string
+	slug           string
 	slack          string
 	discord        string
 	mirrorRole     string
@@ -295,6 +313,12 @@ type slackDiscordPair struct {
 }
 
 func parseChannelPair(line string, channel *slackDiscordPair) {
+	if val, ok := parseAssignment(line, "name"); ok {
+		channel.name = val
+	}
+	if val, ok := parseAssignment(line, "slug"); ok {
+		channel.slug = val
+	}
 	if val, ok := parseAssignment(line, "slack"); ok {
 		channel.slack = val
 	}
@@ -309,12 +333,27 @@ func parseChannelPair(line string, channel *slackDiscordPair) {
 	}
 }
 
+// flushOrgChannel registers an org-level channel, carrying its own mirror_role/
+// mirror_everyone config the same way team channels do (Announcements/General use
+// mirror_everyone; TeamName/TeamSlug here are the channel's own name/slug, not a team).
 func flushOrgChannel(d *Data, channel *slackDiscordPair) {
+	if channel.slack == "" && channel.discord == "" {
+		*channel = slackDiscordPair{}
+		return
+	}
+	info := &TeamInfo{
+		TeamSlug:         channel.slug,
+		TeamName:         channel.name,
+		SlackChannelID:   strings.ToUpper(channel.slack),
+		DiscordChannelID: channel.discord,
+		MirrorRole:       channel.mirrorRole,
+		MirrorEveryone:   channel.mirrorEveryone,
+	}
 	if channel.slack != "" {
-		d.orgSlack[strings.ToUpper(channel.slack)] = true
+		d.orgSlack[strings.ToUpper(channel.slack)] = info
 	}
 	if channel.discord != "" {
-		d.orgDiscord[channel.discord] = true
+		d.orgDiscord[channel.discord] = info
 	}
 	*channel = slackDiscordPair{}
 }
@@ -412,12 +451,38 @@ func (d *Data) IsOrgSlackChannel(channelID string) bool {
 	if d == nil || channelID == "" {
 		return false
 	}
-	return d.orgSlack[strings.ToUpper(channelID)]
+	_, ok := d.orgSlack[strings.ToUpper(channelID)]
+	return ok
 }
 
 func (d *Data) IsOrgDiscordChannel(channelID string) bool {
 	if d == nil || channelID == "" {
 		return false
+	}
+	_, ok := d.orgDiscord[channelID]
+	return ok
+}
+
+// MirrorConfigForSlackChannel returns the mirror config for a Slack channel,
+// whether it's team-owned or a mirror-enabled org channel (e.g. Announcements/General).
+func (d *Data) MirrorConfigForSlackChannel(channelID string) *TeamInfo {
+	if info := d.TeamForSlackChannel(channelID); info != nil {
+		return info
+	}
+	if d == nil || channelID == "" {
+		return nil
+	}
+	return d.orgSlack[strings.ToUpper(channelID)]
+}
+
+// MirrorConfigForDiscordChannel returns the mirror config for a Discord channel,
+// whether it's team-owned or a mirror-enabled org channel (e.g. Announcements/General).
+func (d *Data) MirrorConfigForDiscordChannel(channelID string) *TeamInfo {
+	if info := d.TeamForDiscordChannel(channelID); info != nil {
+		return info
+	}
+	if d == nil || channelID == "" {
+		return nil
 	}
 	return d.orgDiscord[channelID]
 }
