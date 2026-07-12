@@ -271,23 +271,41 @@ func loadGovernanceMember(m *Map, baseURL, realm, token, forgejoURL, username st
 }
 
 func loadFromKeycloakScan(m *Map, baseURL, realm, token string) {
+	// ponytail: don't page all ~4k+ realm users (Keycloak returns garbage past first≈4400).
+	// Only users with discord/slack IdP links can form cross-platform pings.
+	seen := make(map[string]struct{})
+	for _, alias := range []string{"discord", "slack"} {
+		scanKeycloakUsersByIdp(m, baseURL, realm, token, alias, seen)
+	}
+}
+
+// Keycloak admin user search breaks past first≈4400 (HTTP 200 with truncated/invalid JSON).
+const keycloakScanMaxFirst = 4000
+
+func scanKeycloakUsersByIdp(m *Map, baseURL, realm, token, idpAlias string, seen map[string]struct{}) {
 	first := 0
 	const pageSize = 100
-	for {
-		usersURL := fmt.Sprintf("%s/admin/realms/%s/users?first=%d&max=%d", baseURL, url.PathEscape(realm), first, pageSize)
+	for first < keycloakScanMaxFirst {
+		usersURL := fmt.Sprintf(
+			"%s/admin/realms/%s/users?idpAlias=%s&first=%d&max=%d",
+			baseURL, url.PathEscape(realm), url.QueryEscape(idpAlias), first, pageSize,
+		)
 		var users []keycloakUser
 		if err := keycloakGetJSON(usersURL, token, &users); err != nil {
-			log.Printf("bridgeidentity: keycloak user scan stopped at first=%d: %v", first, err)
-			break
+			log.Printf("bridgeidentity: keycloak %s scan stopped at first=%d: %v", idpAlias, first, err)
+			return
 		}
 		if len(users) == 0 {
-			break
+			return
 		}
-
 		for _, user := range users {
 			if user.ID == "" {
 				continue
 			}
+			if _, ok := seen[user.ID]; ok {
+				continue
+			}
+			seen[user.ID] = struct{}{}
 			fedURL := fmt.Sprintf("%s/admin/realms/%s/users/%s/federated-identity", baseURL, url.PathEscape(realm), url.PathEscape(user.ID))
 			var fed []keycloakFedLink
 			if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
@@ -295,12 +313,12 @@ func loadFromKeycloakScan(m *Map, baseURL, realm, token string) {
 			}
 			indexFederatedLinks(m, fed, user.Username, "")
 		}
-
 		if len(users) < pageSize {
-			break
+			return
 		}
 		first += pageSize
 	}
+	log.Printf("bridgeidentity: keycloak %s scan hit first=%d cap", idpAlias, keycloakScanMaxFirst)
 }
 
 // indexFederatedLinks indexes a Keycloak user's linked Discord/Slack/Matrix identities.
@@ -416,7 +434,14 @@ func keycloakGetJSON(reqURL, token string, out any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("keycloak GET %s: HTTP %d", reqURL, resp.StatusCode)
 	}
-	return json.Unmarshal(body, out)
+	if err := json.Unmarshal(body, out); err != nil {
+		snippet := string(body)
+		if len(snippet) > 120 {
+			snippet = snippet[:120] + "…"
+		}
+		return fmt.Errorf("keycloak GET %s: %w (body %q)", reqURL, err, snippet)
+	}
+	return nil
 }
 
 func federatedDiscordID(links []keycloakFedLink) string {

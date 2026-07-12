@@ -117,6 +117,12 @@ func TestLinkedIdentityKeyDedupesCrossPlatformGhosts(t *testing.T) {
 	}
 }
 
+func TestKeycloakScanMaxFirst(t *testing.T) {
+	if keycloakScanMaxFirst >= 4400 {
+		t.Fatalf("scan cap %d must stay below Keycloak's broken first≈4400 offset", keycloakScanMaxFirst)
+	}
+}
+
 func TestIndexFederatedLinksRequiresBothPlatformsForCrossMap(t *testing.T) {
 	m := emptyMap()
 	indexFederatedLinks(m, []keycloakFedLink{
