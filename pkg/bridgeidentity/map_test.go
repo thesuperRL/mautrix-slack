@@ -14,6 +14,25 @@ func setTestMap(m *Map) {
 	mapMu.Unlock()
 }
 
+func TestGetDoesNotBlockWhenUnconfigured(t *testing.T) {
+	mapMu.Lock()
+	globalMap = nil
+	loadedAt = time.Time{}
+	refreshInProgress = false
+	mapMu.Unlock()
+
+	done := make(chan *Map, 1)
+	go func() { done <- Get() }()
+	select {
+	case m := <-done:
+		if m == nil {
+			t.Fatal("Get returned nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Get blocked on Keycloak load")
+	}
+}
+
 func TestCrossPlatformMXIDLookup(t *testing.T) {
 	setTestMap(&Map{
 		discordToSlack: map[string]string{"111222333444555666": "U01SLACK"},

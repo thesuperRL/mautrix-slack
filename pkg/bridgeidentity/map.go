@@ -72,7 +72,7 @@ func GetCached() *Map {
 	return emptyMap()
 }
 
-// Get returns identity links from Keycloak (stale-while-revalidate; first load is synchronous).
+// Get returns identity links from Keycloak (stale-while-revalidate; never blocks).
 func Get() *Map {
 	interval := refreshInterval()
 	mapMu.RLock()
@@ -90,36 +90,34 @@ func Get() *Map {
 		mapMu.Unlock()
 		return m
 	}
-	if stale != nil {
-		if !refreshInProgress {
-			refreshInProgress = true
-			go func() {
-				defer func() {
-					mapMu.Lock()
-					refreshInProgress = false
-					mapMu.Unlock()
-				}()
-				if m, err := loadFromKeycloak(); err == nil {
-					mapMu.Lock()
-					globalMap = m
-					loadedAt = time.Now()
-					mapMu.Unlock()
-				}
+	if !refreshInProgress {
+		refreshInProgress = true
+		go func() {
+			defer func() {
+				mapMu.Lock()
+				refreshInProgress = false
+				mapMu.Unlock()
 			}()
-		}
-		mapMu.Unlock()
+			m, err := loadFromKeycloak()
+			mapMu.Lock()
+			if err == nil {
+				globalMap = m
+			} else {
+				log.Printf("bridgeidentity: keycloak load failed: %v", err)
+				if globalMap == nil {
+					globalMap = emptyMap()
+				}
+			}
+			// ponytail: advance loadedAt on failure too so a dead Keycloak doesn't tight-loop.
+			loadedAt = time.Now()
+			mapMu.Unlock()
+		}()
+	}
+	mapMu.Unlock()
+	if stale != nil {
 		return stale
 	}
-	if m, err := loadFromKeycloak(); err == nil {
-		globalMap = m
-	} else {
-		log.Printf("bridgeidentity: keycloak load failed: %v", err)
-		globalMap = emptyMap()
-	}
-	loadedAt = time.Now()
-	m := globalMap
-	mapMu.Unlock()
-	return m
+	return emptyMap()
 }
 
 func emptyMap() *Map {
@@ -154,7 +152,9 @@ func loadFromKeycloak() (*Map, error) {
 	for _, username := range gov.AllMembers() {
 		loadGovernanceMember(m, baseURL, realm, token, gov.ForgejoURL(), username)
 	}
-	loadFromKeycloakScan(m, baseURL, realm, token)
+	// ponytail: skip full Keycloak user scan (~4k federated-identity GETs per refresh).
+	// That starved Discord/Slack message conversion whenever Get() ran on the hot path.
+	// Governance members cover team pings; re-add a rare overflow scan only if needed.
 	log.Printf("bridgeidentity: loaded %d cross-platform links", len(m.discordToSlack))
 	return m, nil
 }
@@ -176,43 +176,8 @@ func loadGovernanceMember(m *Map, baseURL, realm, token, forgejoURL, username st
 	indexFederatedLinks(m, fed, kcUser.Username, username)
 }
 
-func loadFromKeycloakScan(m *Map, baseURL, realm, token string) error {
-	first := 0
-	const pageSize = 100
-	for {
-		usersURL := fmt.Sprintf("%s/admin/realms/%s/users?first=%d&max=%d", baseURL, url.PathEscape(realm), first, pageSize)
-		var users []keycloakUser
-		if err := keycloakGetJSON(usersURL, token, &users); err != nil {
-			log.Printf("bridgeidentity: keycloak user scan stopped at first=%d: %v", first, err)
-			break
-		}
-		if len(users) == 0 {
-			break
-		}
-
-		for _, user := range users {
-			if user.ID == "" {
-				continue
-			}
-			fedURL := fmt.Sprintf("%s/admin/realms/%s/users/%s/federated-identity", baseURL, url.PathEscape(realm), url.PathEscape(user.ID))
-			var fed []keycloakFedLink
-			if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
-				continue
-			}
-			indexFederatedLinks(m, fed, user.Username, "")
-		}
-
-		if len(users) < pageSize {
-			break
-		}
-		first += pageSize
-	}
-	return nil
-}
-
 // indexFederatedLinks indexes a Keycloak user's linked Discord/Slack/Matrix identities.
-// governanceUsername is the Codeberg/governance username driving this lookup (only set
-// from the governance-member path, not the full-scan path) — used to key
+// governanceUsername is the Codeberg/governance username driving this lookup — used to key
 // usernameToMatrixLocal for team-role-ping → individual-member-mention expansion.
 func indexFederatedLinks(m *Map, fed []keycloakFedLink, keycloakUsername string, governanceUsername string) {
 	discordID := federatedDiscordID(fed)
@@ -476,17 +441,17 @@ func (m *Map) HasSlack(slackUserID string) bool {
 // LinkedIdentityKey returns a stable dedup key for the same person across Discord/Slack puppets.
 func LinkedIdentityKey(mxid id.UserID) string {
 	if discordID := ParseDiscordGhostMXID(mxid); discordID != "" {
-		if Get().HasDiscord(discordID) {
+		if GetCached().HasDiscord(discordID) {
 			return "link:" + discordID
 		}
 	}
 	if slackUID := ParseSlackGhostUserID(mxid); slackUID != "" {
-		if discordID := Get().DiscordIDForSlack(slackUID); discordID != "" {
+		if discordID := GetCached().DiscordIDForSlack(slackUID); discordID != "" {
 			return "link:" + discordID
 		}
 	}
 	if localpart, domain, err := mxid.Parse(); err == nil {
-		if discordID := Get().discordIDForMatrixLocalpart(localpart, domain); discordID != "" {
+		if discordID := GetCached().discordIDForMatrixLocalpart(localpart, domain); discordID != "" {
 			return "link:" + discordID
 		}
 	}
@@ -552,11 +517,11 @@ func DiscordIDForMXID(mxid id.UserID) string {
 	}
 	// For Slack ghosts, look up Discord ID via governance (cross-platform mapping)
 	if slackUID := ParseSlackGhostUserID(mxid); slackUID != "" {
-		return Get().DiscordIDForSlack(slackUID)
+		return GetCached().DiscordIDForSlack(slackUID)
 	}
 	// For Matrix users, look up Discord ID via governance
 	if localpart, domain, err := mxid.Parse(); err == nil {
-		return Get().discordIDForMatrixLocalpart(localpart, domain)
+		return GetCached().discordIDForMatrixLocalpart(localpart, domain)
 	}
 	return ""
 }
@@ -570,11 +535,11 @@ func SlackUserIDForMXID(mxid id.UserID) string {
 	}
 	// For Discord ghosts, look up Slack ID via governance (cross-platform mapping)
 	if discordID := ParseDiscordGhostMXID(mxid); discordID != "" {
-		return Get().SlackUserIDForDiscord(discordID)
+		return GetCached().SlackUserIDForDiscord(discordID)
 	}
 	// For Matrix users, look up Slack ID via governance
 	if localpart, domain, err := mxid.Parse(); err == nil {
-		return Get().slackUserIDForMatrixLocalpart(localpart, domain)
+		return GetCached().slackUserIDForMatrixLocalpart(localpart, domain)
 	}
 	return ""
 }

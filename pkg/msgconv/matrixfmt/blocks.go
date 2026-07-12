@@ -196,7 +196,7 @@ func (parser *HTMLParser) teamRolePingMemberElements(team *governancedata.TeamIn
 	if len(usernames) == 0 {
 		return nil
 	}
-	identity := bridgeidentity.Get()
+	identity := bridgeidentity.GetCached()
 	var mentions []slack.RichTextSectionElement
 	for _, username := range usernames {
 		if slackUserID := identity.SlackUserIDForGovernanceUsername(username); slackUserID != "" {
