@@ -20,7 +20,10 @@ import (
 	"go.mau.fi/mautrix-slack/pkg/governancedata"
 )
 
-const defaultRefreshInterval = 60 * time.Second
+const (
+	defaultRefreshInterval  = 60 * time.Second
+	defaultFullScanInterval = 24 * time.Hour
+)
 
 // Map holds Keycloak-linked Discord ↔ Slack user IDs for cross-platform mentions.
 type Map struct {
@@ -49,6 +52,8 @@ var (
 	globalMap         *Map
 	loadedAt          time.Time
 	refreshInProgress bool
+	lastFullScanAt    time.Time
+	lastGovStamp      string
 	discordGhostRegex = regexp.MustCompile(`^@discord_([0-9]+):`)
 	httpClient        = &http.Client{Timeout: 30 * time.Second}
 )
@@ -60,6 +65,65 @@ func refreshInterval() time.Duration {
 		}
 	}
 	return defaultRefreshInterval
+}
+
+func fullScanInterval() time.Duration {
+	if s := os.Getenv("BRIDGE_IDENTITY_FULL_SCAN_INTERVAL"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultFullScanInterval
+}
+
+func governanceStamp() string {
+	_ = governancedata.Get()
+	path, mod := governancedata.DataStamp()
+	return path + "\x00" + mod.UTC().Format(time.RFC3339Nano)
+}
+
+// shouldFullScan: first load, governance data changed, or 24h since last full crawl.
+func shouldFullScan(stamp string) bool {
+	if lastFullScanAt.IsZero() {
+		return true
+	}
+	if stamp != lastGovStamp {
+		return true
+	}
+	return time.Since(lastFullScanAt) >= fullScanInterval()
+}
+
+func cloneMap(src *Map) *Map {
+	m := emptyMap()
+	if src == nil {
+		return m
+	}
+	m.matrixDomain = src.matrixDomain
+	for k, v := range src.discordToSlack {
+		m.discordToSlack[k] = v
+	}
+	for k, v := range src.slackToDiscord {
+		m.slackToDiscord[k] = v
+	}
+	for k, v := range src.matrixLocalpartDiscord {
+		m.matrixLocalpartDiscord[k] = v
+	}
+	for k, v := range src.matrixLocalpartSlack {
+		m.matrixLocalpartSlack[k] = v
+	}
+	for k, v := range src.slackToMatrixLocalpart {
+		m.slackToMatrixLocalpart[k] = v
+	}
+	for k, v := range src.usernameToMatrixLocal {
+		m.usernameToMatrixLocal[k] = v
+	}
+	return m
+}
+
+func snapshotGlobal() *Map {
+	mapMu.RLock()
+	defer mapMu.RUnlock()
+	return cloneMap(globalMap)
 }
 
 // GetCached returns the in-memory identity map without blocking on Keycloak refresh.
@@ -145,17 +209,30 @@ func loadFromKeycloak() (*Map, error) {
 		return nil, err
 	}
 
-	m := emptyMap()
+	stamp := governanceStamp()
+	full := shouldFullScan(stamp)
+	var m *Map
+	if full {
+		m = emptyMap()
+	} else {
+		// Keep prior full-scan overflow links; re-apply governance members on top.
+		m = snapshotGlobal()
+	}
 	m.matrixDomain = os.Getenv("MATRIX_DOMAIN")
 
 	gov := governancedata.Get()
 	for _, username := range gov.AllMembers() {
 		loadGovernanceMember(m, baseURL, realm, token, gov.ForgejoURL(), username)
 	}
-	// ponytail: skip full Keycloak user scan (~4k federated-identity GETs per refresh).
-	// That starved Discord/Slack message conversion whenever Get() ran on the hot path.
-	// Governance members cover team pings; re-add a rare overflow scan only if needed.
-	log.Printf("bridgeidentity: loaded %d cross-platform links", len(m.discordToSlack))
+	if full {
+		// ponytail: full crawl is ~4k GETs — only on first load, governance data change, or 24h.
+		loadFromKeycloakScan(m, baseURL, realm, token)
+		lastFullScanAt = time.Now()
+		lastGovStamp = stamp
+		log.Printf("bridgeidentity: full keycloak scan loaded %d cross-platform links", len(m.discordToSlack))
+	} else {
+		log.Printf("bridgeidentity: refreshed governance members, %d cross-platform links", len(m.discordToSlack))
+	}
 	return m, nil
 }
 
@@ -174,6 +251,39 @@ func loadGovernanceMember(m *Map, baseURL, realm, token, forgejoURL, username st
 		return
 	}
 	indexFederatedLinks(m, fed, kcUser.Username, username)
+}
+
+func loadFromKeycloakScan(m *Map, baseURL, realm, token string) {
+	first := 0
+	const pageSize = 100
+	for {
+		usersURL := fmt.Sprintf("%s/admin/realms/%s/users?first=%d&max=%d", baseURL, url.PathEscape(realm), first, pageSize)
+		var users []keycloakUser
+		if err := keycloakGetJSON(usersURL, token, &users); err != nil {
+			log.Printf("bridgeidentity: keycloak user scan stopped at first=%d: %v", first, err)
+			break
+		}
+		if len(users) == 0 {
+			break
+		}
+
+		for _, user := range users {
+			if user.ID == "" {
+				continue
+			}
+			fedURL := fmt.Sprintf("%s/admin/realms/%s/users/%s/federated-identity", baseURL, url.PathEscape(realm), url.PathEscape(user.ID))
+			var fed []keycloakFedLink
+			if err := keycloakGetJSON(fedURL, token, &fed); err != nil {
+				continue
+			}
+			indexFederatedLinks(m, fed, user.Username, "")
+		}
+
+		if len(users) < pageSize {
+			break
+		}
+		first += pageSize
+	}
 }
 
 // indexFederatedLinks indexes a Keycloak user's linked Discord/Slack/Matrix identities.

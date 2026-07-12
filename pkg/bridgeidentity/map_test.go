@@ -19,6 +19,8 @@ func TestGetDoesNotBlockWhenUnconfigured(t *testing.T) {
 	globalMap = nil
 	loadedAt = time.Time{}
 	refreshInProgress = false
+	lastFullScanAt = time.Time{}
+	lastGovStamp = ""
 	mapMu.Unlock()
 
 	done := make(chan *Map, 1)
@@ -30,6 +32,38 @@ func TestGetDoesNotBlockWhenUnconfigured(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Get blocked on Keycloak load")
+	}
+}
+
+func TestShouldFullScan(t *testing.T) {
+	lastFullScanAt = time.Time{}
+	lastGovStamp = ""
+	if !shouldFullScan("a") {
+		t.Fatal("expected full scan on first load")
+	}
+	lastFullScanAt = time.Now()
+	lastGovStamp = "a"
+	if shouldFullScan("a") {
+		t.Fatal("expected no full scan within 24h with same governance stamp")
+	}
+	if !shouldFullScan("b") {
+		t.Fatal("expected full scan when governance stamp changes")
+	}
+	lastFullScanAt = time.Now().Add(-25 * time.Hour)
+	lastGovStamp = "a"
+	if !shouldFullScan("a") {
+		t.Fatal("expected full scan after 24h")
+	}
+}
+
+func TestCloneMapPreservesOverflowLinks(t *testing.T) {
+	src := emptyMap()
+	src.discordToSlack["111"] = "U1"
+	src.slackToDiscord["U1"] = "111"
+	cloned := cloneMap(src)
+	cloned.discordToSlack["111"] = "U2"
+	if src.discordToSlack["111"] != "U1" {
+		t.Fatal("cloneMap must deep-copy")
 	}
 }
 

@@ -138,6 +138,14 @@ func Get() *Data {
 	return globalData
 }
 
+// DataStamp is the path + modtime of the last governance load. bridgeidentity uses
+// stamp changes (governance data updated on the host) to trigger a full Keycloak scan.
+func DataStamp() (path string, mod time.Time) {
+	dataMu.RLock()
+	defer dataMu.RUnlock()
+	return loadedPath, loadedMod
+}
+
 func emptyData() *Data {
 	return &Data{
 		slackToTeam:   make(map[string]*TeamInfo),
