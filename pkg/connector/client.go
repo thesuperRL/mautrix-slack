@@ -443,18 +443,26 @@ func (s *SlackClient) SyncChannels(ctx context.Context) {
 	for _, ch := range channels {
 		portalKey := s.makePortalKey(ch)
 		delete(existingPortals, portalKey)
+		channelID := ch.ID
 		var latestMessageID string
 		var hasCounts bool
 		if !s.IsRealUser {
-			ch, err = s.Client.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
-				ChannelID:         ch.ID,
+			// Don't reassign ch before the error check — GetConversationInfo often
+			// returns (nil, err), and logging ch.ID then nil-derefs (crash loop).
+			info, infoErr := s.Client.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
+				ChannelID:         channelID,
 				IncludeLocale:     true,
 				IncludeNumMembers: true,
 			})
-			if err != nil {
-				log.Err(err).Str("channel_id", ch.ID).Msg("Failed to fetch channel info")
+			if infoErr != nil {
+				log.Err(infoErr).Str("channel_id", channelID).Msg("Failed to fetch channel info")
 				continue
 			}
+			if info == nil {
+				log.Warn().Str("channel_id", channelID).Msg("GetConversationInfo returned nil channel")
+				continue
+			}
+			ch = info
 			hasCounts = ch.Latest != nil
 			if hasCounts {
 				latestMessageID = ch.Latest.Timestamp
