@@ -20,7 +20,6 @@ func TestGetDoesNotBlockWhenUnconfigured(t *testing.T) {
 	loadedAt = time.Time{}
 	refreshInProgress = false
 	lastFullScanAt = time.Time{}
-	lastGovStamp = ""
 	mapMu.Unlock()
 
 	done := make(chan *Map, 1)
@@ -37,22 +36,38 @@ func TestGetDoesNotBlockWhenUnconfigured(t *testing.T) {
 
 func TestShouldFullScan(t *testing.T) {
 	lastFullScanAt = time.Time{}
-	lastGovStamp = ""
-	if !shouldFullScan("a") {
+	if !shouldFullScan() {
 		t.Fatal("expected full scan on first load")
 	}
+
+	loc := pittsburghLoc()
+	now := time.Now().In(loc)
+	today4 := time.Date(now.Year(), now.Month(), now.Day(), fullScanHour, 0, 0, 0, loc)
+
 	lastFullScanAt = time.Now()
-	lastGovStamp = "a"
-	if shouldFullScan("a") {
-		t.Fatal("expected no full scan within 24h with same governance stamp")
+	if shouldFullScan() {
+		t.Fatal("expected no full scan right after scanning")
 	}
-	if !shouldFullScan("b") {
-		t.Fatal("expected full scan when governance stamp changes")
-	}
-	lastFullScanAt = time.Now().Add(-25 * time.Hour)
-	lastGovStamp = "a"
-	if !shouldFullScan("a") {
-		t.Fatal("expected full scan after 24h")
+
+	if !now.Before(today4) {
+		lastFullScanAt = today4.Add(-time.Minute)
+		if !shouldFullScan() {
+			t.Fatal("expected full scan after 4am when last scan was before today's 4am")
+		}
+		lastFullScanAt = today4.Add(time.Minute)
+		if shouldFullScan() {
+			t.Fatal("expected no full scan when already scanned after today's 4am")
+		}
+	} else {
+		yesterday4 := today4.Add(-24 * time.Hour)
+		lastFullScanAt = yesterday4.Add(time.Hour)
+		if shouldFullScan() {
+			t.Fatal("expected no full scan before 4am when yesterday's 4am scan happened")
+		}
+		lastFullScanAt = yesterday4.Add(-time.Hour)
+		if !shouldFullScan() {
+			t.Fatal("expected full scan before 4am if yesterday's 4am window was missed")
+		}
 	}
 }
 

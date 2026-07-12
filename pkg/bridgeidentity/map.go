@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	defaultRefreshInterval  = 60 * time.Second
-	defaultFullScanInterval = 24 * time.Hour
+	defaultRefreshInterval = 60 * time.Second
+	fullScanTZ             = "America/New_York"
+	fullScanHour           = 4 // 4:00 Pittsburgh local (ET)
 )
 
 // Map holds Keycloak-linked Discord ↔ Slack user IDs for cross-platform mentions.
@@ -53,7 +54,7 @@ var (
 	loadedAt          time.Time
 	refreshInProgress bool
 	lastFullScanAt    time.Time
-	lastGovStamp      string
+	refreshLoopOnce   sync.Once
 	discordGhostRegex = regexp.MustCompile(`^@discord_([0-9]+):`)
 	httpClient        = &http.Client{Timeout: 30 * time.Second}
 )
@@ -67,30 +68,26 @@ func refreshInterval() time.Duration {
 	return defaultRefreshInterval
 }
 
-func fullScanInterval() time.Duration {
-	if s := os.Getenv("BRIDGE_IDENTITY_FULL_SCAN_INTERVAL"); s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
-		}
+func pittsburghLoc() *time.Location {
+	loc, err := time.LoadLocation(fullScanTZ)
+	if err != nil {
+		return time.FixedZone("EST", -5*3600)
 	}
-	return defaultFullScanInterval
+	return loc
 }
 
-func governanceStamp() string {
-	_ = governancedata.Get()
-	path, mod := governancedata.DataStamp()
-	return path + "\x00" + mod.UTC().Format(time.RFC3339Nano)
-}
-
-// shouldFullScan: first load, governance data changed, or 24h since last full crawl.
-func shouldFullScan(stamp string) bool {
+// shouldFullScan: deploy/startup (never scanned), or at/after 4:00 America/New_York
+// when the last full scan was before today's 4:00.
+func shouldFullScan() bool {
 	if lastFullScanAt.IsZero() {
 		return true
 	}
-	if stamp != lastGovStamp {
-		return true
+	now := time.Now().In(pittsburghLoc())
+	today4 := time.Date(now.Year(), now.Month(), now.Day(), fullScanHour, 0, 0, 0, now.Location())
+	if now.Before(today4) {
+		return lastFullScanAt.Before(today4.Add(-24 * time.Hour))
 	}
-	return time.Since(lastFullScanAt) >= fullScanInterval()
+	return lastFullScanAt.Before(today4)
 }
 
 func cloneMap(src *Map) *Map {
@@ -126,6 +123,25 @@ func snapshotGlobal() *Map {
 	return cloneMap(globalMap)
 }
 
+func publishMap(m *Map) {
+	mapMu.Lock()
+	globalMap = cloneMap(m)
+	loadedAt = time.Now()
+	mapMu.Unlock()
+}
+
+func ensureRefreshLoop() {
+	refreshLoopOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(refreshInterval())
+			defer t.Stop()
+			for range t.C {
+				Get()
+			}
+		}()
+	})
+}
+
 // GetCached returns the in-memory identity map without blocking on Keycloak refresh.
 func GetCached() *Map {
 	mapMu.RLock()
@@ -138,6 +154,7 @@ func GetCached() *Map {
 
 // Get returns identity links from Keycloak (stale-while-revalidate; never blocks).
 func Get() *Map {
+	ensureRefreshLoop()
 	interval := refreshInterval()
 	mapMu.RLock()
 	if globalMap != nil && time.Since(loadedAt) < interval {
@@ -209,8 +226,7 @@ func loadFromKeycloak() (*Map, error) {
 		return nil, err
 	}
 
-	stamp := governanceStamp()
-	full := shouldFullScan(stamp)
+	full := shouldFullScan()
 	var m *Map
 	if full {
 		m = emptyMap()
@@ -225,10 +241,11 @@ func loadFromKeycloak() (*Map, error) {
 		loadGovernanceMember(m, baseURL, realm, token, gov.ForgejoURL(), username)
 	}
 	if full {
-		// ponytail: full crawl is ~4k GETs — only on first load, governance data change, or 24h.
+		// Publish members first so mirroring isn't empty-handed for the multi-minute crawl.
+		publishMap(m)
+		log.Printf("bridgeidentity: starting full keycloak user scan (%d governance links so far)", len(m.discordToSlack))
 		loadFromKeycloakScan(m, baseURL, realm, token)
 		lastFullScanAt = time.Now()
-		lastGovStamp = stamp
 		log.Printf("bridgeidentity: full keycloak scan loaded %d cross-platform links", len(m.discordToSlack))
 	} else {
 		log.Printf("bridgeidentity: refreshed governance members, %d cross-platform links", len(m.discordToSlack))
