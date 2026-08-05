@@ -77,7 +77,7 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 func capID() string {
-	base := "fi.mau.slack.capabilities.2025_10_29"
+	base := "fi.mau.slack.capabilities.2026_08_04"
 	if ffmpeg.Supported() {
 		return base + "+ffmpeg"
 	}
@@ -151,7 +151,9 @@ var roomCaps = &event.RoomFeatures{
 		},
 		event.CapMsgGIF: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"image/gif": event.CapLevelFullySupported,
+				"image/gif":  event.CapLevelFullySupported,
+				"video/mp4":  event.CapLevelFullySupported,
+				"video/webm": event.CapLevelFullySupported,
 			},
 			Caption:          event.CapLevelFullySupported,
 			MaxCaptionLength: MaxTextLength,
