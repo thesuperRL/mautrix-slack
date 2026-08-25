@@ -510,10 +510,36 @@ func (mc *MessageConverter) slackBlocksToMatrix(ctx context.Context, portal *bri
 			continue
 		}
 		if attachment.IsMsgUnfurl {
+			escapedFromURL := html.EscapeString(attachment.FromURL)
+			if attachment.FromURL != "" && !strings.Contains(htmlText.String(), `href="`+escapedFromURL+`"`) {
+				var label string
+				switch {
+				case attachment.AuthorName != "" && attachment.Footer != "":
+					label = attachment.AuthorName + " " + attachment.Footer
+				case attachment.AuthorName != "":
+					label = attachment.AuthorName
+				default:
+					label = attachment.FromURL
+				}
+				htmlText.WriteString(fmt.Sprintf(`<a href="%s">%s</a>`, escapedFromURL, html.EscapeString(label)))
+			}
 			for _, message_block := range attachment.MessageBlocks {
 				renderedAttachment := mc.blocksToHTML(ctx, message_block.Message.Blocks, true, mentions)
 				htmlText.WriteString(fmt.Sprintf("<blockquote><b>%s</b><br>%s<a href=\"%s\"><i>%s</i></a><br></blockquote>",
 					attachment.AuthorName, renderedAttachment, attachment.FromURL, attachment.Footer))
+			}
+			if len(attachment.MessageBlocks) == 0 && (attachment.Text != "" || attachment.Fallback != "") {
+				fallbackText := attachment.Text
+				if fallbackText == "" {
+					fallbackText = attachment.Fallback
+				}
+				htmlText.WriteString(fmt.Sprintf(
+					`<blockquote><b>%s</b><br>%s<a href="%s"><i>%s</i></a><br></blockquote>`,
+					html.EscapeString(attachment.AuthorName),
+					mc.mrkdwnToMatrixHtml(ctx, fallbackText, mentions),
+					html.EscapeString(attachment.FromURL),
+					html.EscapeString(attachment.Footer),
+				))
 			}
 		} else if len(attachment.Blocks.BlockSet) > 0 {
 			for _, message_block := range attachment.Blocks.BlockSet {
